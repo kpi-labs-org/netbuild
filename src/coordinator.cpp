@@ -1,10 +1,13 @@
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <limits>
 
 #include <SDL3/SDL.h>
 #include <SDL3_net/SDL_net.h>
@@ -14,10 +17,20 @@
 
 namespace fs = std::filesystem;
 
-uint16_t discover_worker(NET_Address *worker_addr) {
-	DatagramPtr udp_sock(
-		NET_CreateDatagramSocket(nullptr, 0, 0)
-	);
+struct WorkerConfig {
+	std::string host;
+	uint16_t udp_port;
+};
+
+struct WorkerInfo {
+	std::string host;
+	uint16_t udp_port;
+	uint16_t tcp_port;
+	AddressPtr address;
+};
+
+uint16_t discover_worker(NET_Address *worker_addr, uint16_t udp_port) {
+	DatagramPtr udp_sock(NET_CreateDatagramSocket(nullptr, 0, 0));
 
 	if (!udp_sock) {
 		throw std::runtime_error(std::string("UDP socket: ") + SDL_GetError());
@@ -27,7 +40,7 @@ uint16_t discover_worker(NET_Address *worker_addr) {
 	std::string ping_str = ping_req.dump();
 
 	if (!NET_SendDatagram(
-		udp_sock.get(), worker_addr, UDP_PORT,
+		udp_sock.get(), worker_addr, udp_port,
 		ping_str.data(), static_cast<int>(ping_str.size())
 	)) {
 		throw std::runtime_error(std::string("Failed to send PING: ") + SDL_GetError());
@@ -45,20 +58,18 @@ uint16_t discover_worker(NET_Address *worker_addr) {
 
 		PacketPtr packet(dgram);
 
-		if (packet) {
+		if (packet && packet->port == udp_port &&
+			NET_CompareAddresses(packet->addr, worker_addr) == 0) {
 			std::string raw_json(
-				reinterpret_cast<const char *>(packet->buf),
-				packet->buflen
+				reinterpret_cast<const char *>(packet->buf), packet->buflen
 			);
 
 			json pong_res = json::parse(raw_json, nullptr, false);
 
 			if (pong_res.is_object() &&
-				pong_res.contains("type") &&
-				pong_res["type"].is_string() &&
+				pong_res.contains("type") && pong_res["type"].is_string() &&
 				pong_res["type"] == "PONG" &&
-				pong_res.contains("tcp_port") &&
-				pong_res["tcp_port"].is_number_unsigned()) {
+				pong_res.contains("tcp_port") && pong_res["tcp_port"].is_number_unsigned()) {
 
 				uint64_t port = pong_res["tcp_port"].get<uint64_t>();
 
@@ -71,7 +82,7 @@ uint16_t discover_worker(NET_Address *worker_addr) {
 		SDL_Delay(10);
 	}
 
-	throw std::runtime_error("No available worker");
+	return 0;
 }
 
 void compile_file(
@@ -83,9 +94,6 @@ void compile_file(
 	int task_id
 ) {
 	fs::path ii_file = temp_dir / ("task_" + std::to_string(task_id) + ".ii");
-
-	std::cout << "[" << task_id << "] Preprocessing "
-		<< source_file.string() << "..." << std::endl;
 
 	int ret = run_process({
 		"g++", "-E", "-x", "c++",
@@ -102,15 +110,12 @@ void compile_file(
 		throw std::runtime_error("Failed to read preprocessed file: " + source_file.string());
 	}
 
-	// The preprocessed file is no longer needed after loading.
 	{
 		std::error_code ec;
 		fs::remove(ii_file, ec);
 	}
 
-	StreamPtr tcp_client(
-		NET_CreateClient(worker_addr, worker_tcp_port, 0)
-	);
+	StreamPtr tcp_client(NET_CreateClient(worker_addr, worker_tcp_port, 0));
 
 	if (!tcp_client) {
 		throw std::runtime_error(std::string("TCP socket: ") + SDL_GetError());
@@ -132,8 +137,14 @@ void compile_file(
 		throw std::runtime_error(std::string("Failed to send JOB: ") + SDL_GetError());
 	}
 
-	std::cout << "[" << task_id << "] JOB sent ("
-		<< ii_data.size() << " bytes)" << std::endl;
+	// GCC may take longer than a regular socket read timeout.
+	void *sockets[] = {tcp_client.get()};
+	int ready = NET_WaitUntilInputAvailable(sockets, 1, 120000);
+
+	if (ready <= 0) {
+		throw std::runtime_error(ready == 0 ? "Compilation timed out" :
+			std::string("Waiting for RESULT failed: ") + SDL_GetError());
+	}
 
 	Message response;
 	std::string error;
@@ -151,8 +162,7 @@ void compile_file(
 	if (type == "ERROR") {
 		std::string message = "Compilation failed";
 
-		if (response.header.contains("message") &&
-			response.header["message"].is_string()) {
+		if (response.header.contains("message") && response.header["message"].is_string()) {
 			message = response.header["message"].get<std::string>();
 		}
 
@@ -166,17 +176,11 @@ void compile_file(
 	if (!save_file(object_file, response.payload)) {
 		throw std::runtime_error("Failed to save object file: " + object_file.string());
 	}
-
-	tcp_client.reset();
-
-	std::cout << "[" << task_id << "] Compiled "
-		<< source_file.string() << std::endl;
 }
 
 int main(int argc, char *argv[]) {
 	try {
 		NetworkContext net;
-
 		std::vector<fs::path> source_files;
 
 		if (argc == 1) {
@@ -193,59 +197,118 @@ int main(int argc, char *argv[]) {
 			}
 		}
 
+		if (source_files.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+			throw std::runtime_error("Too many source files");
+		}
+
 		for (const auto &source : source_files) {
 			if (!fs::is_regular_file(source)) {
 				throw std::runtime_error("Source file not found: " + source.string());
 			}
 		}
 
-		std::cout << "NetBuild: " << source_files.size()
-			<< " translation unit(s)" << std::endl;
+		std::vector<WorkerConfig> configured_workers = {
+			{"127.0.0.1", 41000},
+			{"127.0.0.1", 41002}
+		};
 
-		std::string worker_ip = "127.0.0.1";
-		AddressPtr worker_addr = resolve_address(worker_ip);
+		std::vector<WorkerInfo> workers;
 
-		uint16_t worker_tcp_port = discover_worker(worker_addr.get());
+		for (const auto &config : configured_workers) {
+			try {
+				AddressPtr addr = resolve_address(config.host);
+				uint16_t tcp_port = discover_worker(addr.get(), config.udp_port);
 
-		std::cout << "Worker discovered. TCP port: "
-			<< worker_tcp_port << std::endl;
+				if (tcp_port == 0) {
+					std::cerr << "Worker unavailable: " << config.host
+						<< ":" << config.udp_port << std::endl;
+					continue;
+				}
+
+				std::cout << "Worker discovered: " << config.host
+					<< " (TCP " << tcp_port << ")" << std::endl;
+
+				workers.push_back({config.host, config.udp_port, tcp_port, std::move(addr)});
+			} catch (const std::exception &e) {
+				std::cerr << "Worker unavailable: " << config.host
+					<< ":" << config.udp_port << " (" << e.what() << ")" << std::endl;
+			}
+		}
+
+		if (workers.empty()) {
+			throw std::runtime_error("No available workers");
+		}
+
+		std::cout << "NetBuild: " << source_files.size() << " translation unit(s), "
+			<< workers.size() << " worker(s)" << std::endl;
 
 		TempDir temp;
 		std::vector<fs::path> object_files;
 
 		for (size_t i = 0; i < source_files.size(); ++i) {
-			int task_id = static_cast<int>(i + 1);
-
-			fs::path object_file = temp.path() /
-				("task_" + std::to_string(task_id) + ".o");
-
-			compile_file(
-				worker_addr.get(),
-				worker_tcp_port,
-				source_files[i],
-				object_file,
-				temp.path(),
-				task_id
-			);
-
-			object_files.push_back(object_file);
+			object_files.push_back(temp.path() / ("task_" + std::to_string(i + 1) + ".o"));
 		}
 
-		std::cout << "Linking " << object_files.size()
-			<< " object file(s)..." << std::endl;
+		std::atomic<size_t> next_task{0};
+		std::atomic<bool> failed{false};
+		std::mutex result_mutex;
+		std::string first_error;
+		std::vector<std::thread> threads;
+
+		for (auto &worker : workers) {
+			WorkerInfo *current = &worker;
+
+			threads.emplace_back([&, current]() {
+				while (!failed.load()) {
+					size_t index = next_task.fetch_add(1);
+					if (index >= source_files.size()) break;
+
+					int task_id = static_cast<int>(index + 1);
+
+					{
+						std::lock_guard<std::mutex> lock(result_mutex);
+						std::cout << "[" << task_id << "] " << current->host
+							<< ":" << current->tcp_port << " compiling "
+							<< source_files[index].string() << std::endl;
+					}
+
+					try {
+						compile_file(
+							current->address.get(), current->tcp_port,
+							source_files[index], object_files[index], temp.path(), task_id
+						);
+
+						std::lock_guard<std::mutex> lock(result_mutex);
+						std::cout << "[" << task_id << "] Completed" << std::endl;
+					} catch (const std::exception &e) {
+						std::lock_guard<std::mutex> lock(result_mutex);
+						if (!failed.exchange(true)) {
+							first_error = "Task " + std::to_string(task_id) + ": " + e.what();
+						}
+						break;
+					}
+				}
+			});
+		}
+
+		for (auto &thread : threads) {
+			thread.join();
+		}
+
+		if (failed) {
+			throw std::runtime_error(first_error);
+		}
 
 		std::vector<std::string> link_args = {"g++"};
-
 		for (const auto &object_file : object_files) {
 			link_args.push_back(object_file.string());
 		}
-
 		link_args.push_back("-o");
 		link_args.push_back("result_app");
 
-		int ret = run_process(link_args);
+		std::cout << "Linking " << object_files.size() << " object file(s)..." << std::endl;
 
-		if (ret != 0) {
+		if (run_process(link_args) != 0) {
 			throw std::runtime_error("Linking failed");
 		}
 
@@ -257,3 +320,4 @@ int main(int argc, char *argv[]) {
 
 	return 0;
 }
+

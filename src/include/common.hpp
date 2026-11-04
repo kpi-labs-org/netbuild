@@ -12,8 +12,11 @@
 #include <vector>
 #include <cerrno>
 #include <cstring>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 struct NetworkContext {
 	NetworkContext() {
@@ -130,30 +133,21 @@ public:
 inline int run_process(const std::vector<std::string> &args) {
 	if (args.empty()) return -1;
 
-	pid_t pid = fork();
+	std::vector<char *> argv;
+	for (const auto &arg : args) {
+		argv.push_back(const_cast<char *>(arg.c_str()));
+	}
+	argv.push_back(nullptr);
 
-	if (pid < 0) {
-		std::cerr << "fork failed: " << std::strerror(errno) << std::endl;
+	pid_t pid = 0;
+	int spawn_error = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), environ);
+
+	if (spawn_error != 0) {
+		std::cerr << "posix_spawnp failed: " << std::strerror(spawn_error) << std::endl;
 		return -1;
 	}
 
-	if (pid == 0) {
-		std::vector<char *> argv;
-
-		for (const auto &arg : args) {
-			argv.push_back(const_cast<char *>(arg.c_str()));
-		}
-
-		argv.push_back(nullptr);
-
-		execvp(argv[0], argv.data());
-
-		std::cerr << "execvp failed: " << std::strerror(errno) << std::endl;
-		_exit(127);
-	}
-
 	int status = 0;
-
 	while (waitpid(pid, &status, 0) < 0) {
 		if (errno != EINTR) {
 			std::cerr << "waitpid failed: " << std::strerror(errno) << std::endl;
@@ -176,12 +170,9 @@ inline bool load_file(
 	std::error_code ec;
 	uintmax_t file_size = std::filesystem::file_size(path, ec);
 
-	if (ec || file_size > max_size) {
-		return false;
-	}
+	if (ec || file_size > max_size) return false;
 
 	std::ifstream ifs(path, std::ios::binary);
-
 	if (!ifs.is_open()) return false;
 
 	data.resize(static_cast<size_t>(file_size));
@@ -199,7 +190,6 @@ inline bool save_file(
 	const std::vector<uint8_t> &data
 ) {
 	std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-
 	if (!ofs.is_open()) return false;
 
 	if (!data.empty()) {
