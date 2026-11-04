@@ -1,113 +1,188 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <cstdlib>
+#include <chrono>
+#include <filesystem>
+#include <stdexcept>
+
 #include <SDL3/SDL.h>
 #include <SDL3_net/SDL_net.h>
+
 #include "include/protocol.hpp"
+#include "include/common.hpp"
 
-std::vector<uint8_t> preprocess_file(const std::string &filename) {
-	std::string out_file = filename + ".ii";
-	std::string cmd = "g++ -E " + filename + " -o " + out_file;
-	if (std::system(cmd.c_str()) != 0) return {};
+namespace fs = std::filesystem;
 
-	std::ifstream ifs(out_file, std::ios::binary | std::ios::ate);
-	if (!ifs.is_open()) return {};
-	size_t size = ifs.tellg();
-	ifs.seekg(0);
-	std::vector<uint8_t> data(size);
-	ifs.read(reinterpret_cast<char *>(data.data()), size);
-	return data;
-}
+uint16_t discover_worker(NET_Address *worker_addr) {
+	DatagramPtr udp_sock(
+		NET_CreateDatagramSocket(nullptr, 0, 0)
+	);
 
-int main() {
-	SDL_Init(0);
-	NET_Init();
-
-	std::string worker_ip = "127.0.0.1";
-	uint16_t worker_udp_port = 41000;
-	uint16_t worker_tcp_port = 0;
-
-	NET_Address *worker_addr = NET_ResolveHostname(worker_ip.c_str());
-	if (NET_WaitUntilResolved(worker_addr, 5000) < 0) {
-		std::cerr << "Failed to resolve hostname" << std::endl;
-		return 1;
+	if (!udp_sock) {
+		throw std::runtime_error(std::string("UDP socket: ") + SDL_GetError());
 	}
-
-	NET_DatagramSocket *udp_sock = NET_CreateDatagramSocket(nullptr, 0, 0);
 
 	json ping_req = {{"type", "PING"}};
 	std::string ping_str = ping_req.dump();
-	NET_SendDatagram(udp_sock, worker_addr, worker_udp_port, ping_str.c_str(), static_cast<int>(ping_str.size()));
 
-	for (int i = 0; i < 50; ++i) {
+	if (!NET_SendDatagram(
+		udp_sock.get(), worker_addr, UDP_PORT,
+		ping_str.data(), static_cast<int>(ping_str.size())
+	)) {
+		throw std::runtime_error(std::string("Failed to send PING: ") + SDL_GetError());
+	}
+
+	auto deadline = std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(DISCOVERY_TIMEOUT_MS);
+
+	while (std::chrono::steady_clock::now() < deadline) {
 		NET_Datagram *dgram = nullptr;
-		if (NET_ReceiveDatagram(udp_sock, &dgram) && dgram != nullptr) {
-			std::string raw_json(reinterpret_cast<char *>(dgram->buf), dgram->buflen);
-			json pong_res = json::parse(raw_json, nullptr, false);
-			if (!pong_res.is_discarded() && pong_res.value("type", "") == "PONG") {
-				worker_tcp_port = pong_res.value("tcp_port", 0);
-			}
-			NET_DestroyDatagram(dgram);
-			if (worker_tcp_port != 0) break;
+
+		if (!NET_ReceiveDatagram(udp_sock.get(), &dgram)) {
+			throw std::runtime_error(std::string("UDP receive: ") + SDL_GetError());
 		}
+
+		PacketPtr packet(dgram);
+
+		if (packet) {
+			std::string raw_json(
+				reinterpret_cast<const char *>(packet->buf),
+				packet->buflen
+			);
+
+			json pong_res = json::parse(raw_json, nullptr, false);
+
+			if (pong_res.is_object() &&
+				pong_res.contains("type") &&
+				pong_res["type"].is_string() &&
+				pong_res["type"] == "PONG" &&
+				pong_res.contains("tcp_port") &&
+				pong_res["tcp_port"].is_number_unsigned()) {
+
+				uint64_t port = pong_res["tcp_port"].get<uint64_t>();
+
+				if (port > 0 && port <= 65535) {
+					return static_cast<uint16_t>(port);
+				}
+			}
+		}
+
 		SDL_Delay(10);
 	}
-	NET_DestroyDatagramSocket(udp_sock);
 
-	if (worker_tcp_port == 0) {
-		std::cerr << "No available worker" << std::endl;
-		NET_UnrefAddress(worker_addr);
-		return 1;
-	}
+	throw std::runtime_error("No available worker");
+}
 
-	std::vector<uint8_t> ii_data = preprocess_file("main.cpp");
-	if (ii_data.empty()) {
-		std::cerr << "Preprocessing failed" << std::endl;
-		NET_UnrefAddress(worker_addr);
-		return 1;
-	}
+int main() {
+	try {
+		NetworkContext net;
 
-	NET_StreamSocket *tcp_client = NET_CreateClient(worker_addr, worker_tcp_port, 0);
-	if (NET_WaitUntilConnected(tcp_client, 5000) < 0) {
-		std::cerr << "TCP connection failed" << std::endl;
-		NET_DestroyStreamSocket(tcp_client);
-		NET_UnrefAddress(worker_addr);
-		return 1;
-	}
+		std::string worker_ip = "127.0.0.1";
+		AddressPtr worker_addr = resolve_address(worker_ip);
 
-	auto job_msg = serialize_tcp_message("JOB", 1, ii_data);
-	write_exact(tcp_client, job_msg.data(), job_msg.size());
+		uint16_t worker_tcp_port = discover_worker(worker_addr.get());
 
-	uint32_t header_size_be = 0;
-	if (read_exact(tcp_client, &header_size_be, sizeof(uint32_t))) {
-		uint32_t header_size = SDL_Swap32BE(header_size_be);
+		std::cout << "Worker discovered. TCP port: "
+			<< worker_tcp_port << std::endl;
 
-		std::vector<char> json_data(header_size + 1, '\0');
-		if (read_exact(tcp_client, json_data.data(), header_size)) {
-			json header = json::parse(json_data.data(), nullptr, false);
+		TempDir temp;
 
-			if (!header.is_discarded() && header.value("type", "") == "RESULT") {
-				size_t payload_size = header.value("payload_size", 0);
-				std::vector<uint8_t> obj_data(payload_size);
-				if (read_exact(tcp_client, obj_data.data(), payload_size)) {
-					std::ofstream ofs("main.o", std::ios::binary);
-					ofs.write(reinterpret_cast<const char *>(obj_data.data()), obj_data.size());
-					ofs.close();
+		fs::path ii_file = temp.path() / "main.ii";
+		fs::path obj_file = temp.path() / "main.o";
 
-					std::cout << "Linking..." << std::endl;
-					std::system("g++ main.o -o result_app");
-				}
-			} else if (!header.is_discarded() && header.value("type", "") == "ERROR") {
-				std::cerr << "Worker error: " << header.value("message", "unknown") << std::endl;
-			}
+		std::cout << "Preprocessing main.cpp..." << std::endl;
+
+		int ret = run_process({
+			"g++", "-E", "-x", "c++",
+			"main.cpp", "-o", ii_file.string()
+		});
+
+		if (ret != 0) {
+			throw std::runtime_error("Preprocessing failed");
 		}
-	}
 
-	NET_DestroyStreamSocket(tcp_client);
-	NET_UnrefAddress(worker_addr);
-	NET_Quit();
-	SDL_Quit();
+		std::vector<uint8_t> ii_data;
+
+		if (!load_file(ii_file, ii_data, MAX_PAYLOAD_SIZE) || ii_data.empty()) {
+			throw std::runtime_error("Failed to read preprocessed file");
+		}
+
+		StreamPtr tcp_client(
+			NET_CreateClient(worker_addr.get(), worker_tcp_port, 0)
+		);
+
+		if (!tcp_client) {
+			throw std::runtime_error(std::string("TCP socket: ") + SDL_GetError());
+		}
+
+		NET_Status status = NET_WaitUntilConnected(tcp_client.get(), 5000);
+
+		if (status != NET_SUCCESS) {
+			if (status == NET_WAITING) {
+				throw std::runtime_error("TCP connection timed out");
+			}
+
+			throw std::runtime_error(std::string("TCP connection failed: ") + SDL_GetError());
+		}
+
+		auto job_msg = serialize_tcp_message("JOB", 1, ii_data);
+
+		if (!write_exact(tcp_client.get(), job_msg.data(), job_msg.size())) {
+			throw std::runtime_error(std::string("Failed to send JOB: ") + SDL_GetError());
+		}
+
+		std::cout << "JOB sent (" << ii_data.size() << " bytes)" << std::endl;
+
+		Message response;
+		std::string error;
+
+		if (!read_tcp_message(tcp_client.get(), response, error)) {
+			throw std::runtime_error("Failed to read response: " + error);
+		}
+
+		if (response.header["task_id"] != 1) {
+			throw std::runtime_error("Unexpected task ID");
+		}
+
+		std::string type = response.header["type"].get<std::string>();
+
+		if (type == "ERROR") {
+			std::string message = "Compilation failed";
+
+			if (response.header.contains("message") &&
+				response.header["message"].is_string()) {
+				message = response.header["message"].get<std::string>();
+			}
+
+			throw std::runtime_error("Worker error: " + message);
+		}
+
+		if (type != "RESULT" || response.payload.empty()) {
+			throw std::runtime_error("Invalid RESULT response");
+		}
+
+		if (!save_file(obj_file, response.payload)) {
+			throw std::runtime_error("Failed to save object file");
+		}
+
+		// Release the TCP connection before linking.
+		tcp_client.reset();
+
+		std::cout << "Linking..." << std::endl;
+
+		ret = run_process({
+			"g++", obj_file.string(), "-o", "result_app"
+		});
+
+		if (ret != 0) {
+			throw std::runtime_error("Linking failed");
+		}
+
+		std::cout << "Build completed: ./result_app" << std::endl;
+	} catch (const std::exception &e) {
+		std::cerr << "Coordinator error: " << e.what() << std::endl;
+		return 1;
+	}
 
 	return 0;
 }
