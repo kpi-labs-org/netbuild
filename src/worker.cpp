@@ -87,7 +87,6 @@ int main() {
 	try {
 		NetworkContext net;
 
-		// Stage 1: only localhost connections.
 		AddressPtr local_addr = resolve_address("127.0.0.1");
 
 		DatagramPtr udp_sock(
